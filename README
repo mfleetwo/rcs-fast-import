@@ -1,0 +1,17 @@
+		rcs-fast-import
+
+rcs-fast-import unpacks a git fast-import stream into an RCS file tree
+
+I wrote this as a prod at more recent and putatively more advanced
+version-control systems that don't have .fi importers yet.  If crufty
+old RCS can import these streams, why can't yours?
+
+The metadata in modern DVCSes can't really be stuffed back into RCS,
+but this tool makes a valiant effort and may occasionally be useful
+for extracting the revision histories of individual files from a
+project history.
+
+It keeps the revision structure, comments, authorship dates, and tag names.
+It loses tag dates and comments and authorship information; commits are
+recorded as though they were from the user invoking it.  However, all
+import-stream metadata is preserved in RFC-822-style headers in commits.

@@ -1,0 +1,840 @@
+#!/usr/bin/env python
+#
+# rcs-fast-import - break a git import stream into corresponding RCS files.
+#
+# By ESR, November 2010.  BSD terms apply.
+#
+# Requires Python 2.5 or newer and RCS 5.7 or newer.
+#
+"""
+Usage: rcs-fast-import [-v] [-p] [-u] [-l] [-V] [-?] 
+
+Break the content of a git-fast-import stream on stdin into individual RCS
+master files in RCS subdirectories of the corresponding directory structure.
+
+With the -v option, emit a twirling-baton prompt during stream read, and
+more progress messages during RCS writes.
+
+Normally, committer and author data are written into each comment as
+RFC-822 mail headers, followed by a blank line.  The -p option suppresses
+this, producing a plain RCS comment.
+
+With the -l option, check out and lock all resulting files at their latest
+revisions; with the -u option, check out but do not lock.
+
+The -V option displays the program version number and exits. -? displays
+this help and exits.
+"""
+
+import sys, os, getopt, re, cStringIO, subprocess
+import time, shlex, email.message, email.utils
+
+version="0.1"
+
+#
+# Generic import-stream machinery swiped from reposurgeon begins here.
+#
+
+verbose         = 0
+DEBUG_BRANCHING = 1    # Debug revision assignment and branch mapping
+DEBUG_OPS       = 2    # Show import-stream operations
+DEBUG_UNQUIET   = 2    # Don't suppress messages from RCS tools
+DEBUG_SHUFFLE   = 3    # Debug directory handling
+DEBUG_COMMANDS  = 3    # Show commands as they are executed
+DEBUG_DELETE    = 4    # Debug canonicalization after deletes
+
+class Baton:
+    "Ship progress indications to stdout."
+    def __init__(self, prompt, endmsg='done', enable=False):
+        self.prompt = prompt
+        self.endmsg = endmsg
+        if enable:
+            self.stream = sys.stdout
+        else:
+            self.stream = None
+    def __enter__(self):
+        if self.stream:
+            self.stream.write(self.prompt + "...")
+            if os.isatty(self.stream.fileno()):
+                self.stream.write(" \010")
+            self.stream.flush()
+        self.count = 0
+        self.time = time.time()
+        return self
+    def twirl(self, ch=None):
+        if self.stream is None:
+            return
+        if os.isatty(self.stream.fileno()):
+            if ch:
+                self.stream.write(ch)
+            else:
+                self.stream.write("-/|\\"[self.count % 4])
+                self.stream.write("\010")
+            self.stream.flush()
+        self.count = self.count + 1
+        return
+    def __exit__(self, extype, value_unused, traceback_unused):
+        if extype == KeyboardInterrupt:
+            self.endmsg = "interrupted"
+        if extype == FatalException:
+            self.endmsg = "aborted by error"
+        if self.stream:
+            self.stream.write("...(%2.2f sec) %s.\n" \
+                              % (time.time() - self.time, self.endmsg))
+        return False
+
+def nuke(directory, legend):
+    "Remove a (large) directory, with a progress indicator."
+    with Baton(legend, enable=verbose>=DEBUG_SHUFFLE) as baton:
+        for root, dirs, files in os.walk(directory, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+                baton.twirl()
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+                baton.twirl()
+    try:
+        os.rmdir(directory)
+    except OSError:
+        pass
+
+class Date:
+    "A time/date in local time. Preserves TZ information but doesn't use it."
+    def __init__(self, text):
+        "Recognize date formats that exporters or email programs might emit."
+        # First, look for git's preferred format.
+        text = text.strip() 
+        if re.match(r"[0-9]+\s*[+-][0-9]+$", text):
+            (self.timestamp, self.timezone) = text.split()
+            self.timestamp = int(self.timestamp)
+            return
+        # If that didn't work, look for an RFC822 date, which git also
+        # accepts. Note, there could be edge cases that Python's parser
+        # handles but git doesn't.
+        try:
+            self.timestamp = int(time.mktime(email.utils.parsedate(text)))
+            self.timezone = text.split()[5]
+            return
+        except TypeError:
+            # time.mktime throws this when it gets None:
+            # TypeError: argument must be 9-item sequence, not None
+            pass
+        # Date format not recognized
+        raise FatalException("'%s' is not a valid timestamp" % text)
+    def rfc822(self):
+        "Format as an RFC822 timestamp."
+        return time.strftime("%a %d %b %Y %H:%M:%S", time.localtime(self.timestamp)) + " " + self.timezone
+
+class Attribution:
+    "Represents an attribution of a repo action to a person and time."
+    def __init__(self, person=None):
+        self.name = self.email = self.date = None
+        if person:
+            # First, validity-check the email address
+            (self.name, self.email) = email.utils.parseaddr(person)
+            if not self.name or not self.email:
+                FatalException("can't recognize address in attribution")
+            # Attribution format is actually stricter than RFC822;
+            # needs to have a following date in the right place.
+            person = person.replace(" <", "|").replace("> ", "|")
+            try:
+                self.date = Date(person.strip().split("|")[2])
+            except (ValueError, IndexError):
+                raise FatalException("malformed attribution %s" % person)
+    def email_out(self, msg, hdr):
+        "Update an RC822 message object with a representation of this."
+        msg[hdr] = self.name + " <" + self.email + ">"
+        msg[hdr + "-Date"] = self.date.rfc822()
+
+class Blob:
+    "Represent a detached blob of data referenced by a mark."
+    def __init__(self, repo):
+        self.repo = repo
+        self.mark = None
+        self.path = None      # First in-repo path associated with this blob
+        self.color = None
+    def blobfile(self):
+        return self.repo.subdir() + "/blob-" + `id(self)` + "-" + self.mark
+
+class Tag:
+    "Represents an annotated tag."
+    def __init__(self, name, committish, tagger, content):
+        self.name = name
+        self.committish = committish
+        self.tagger = tagger
+        self.comment = content
+    def email_out(self):
+        msg = email.message.Message()
+        msg["Tag-Name"] = self.name
+        if self.tagger:
+            self.tagger.email_out(msg, "Tagger")
+        msg.set_payload(self.comment)
+        return msg.as_string(False)
+
+class Reset:
+    "Represents a branch creation."
+    def __init__(self):
+        self.ref = None
+        self.committish = None
+
+class FileOp:
+    "Represent a primitive operation on a file."
+    modify_re = re.compile(r"(M) ([0-9]+) (\S+) (.*)")
+    def __init__(self, opline, commit):
+        self.commit = commit                 # Only used for debugging.
+        if opline.startswith("M"):
+            m = FileOp.modify_re.match(opline)
+            if not m:
+                raise FatalException("bad format of M line: %s" % `opline`)
+            (self.op, self.mode, self.ref, self.path) = m.groups()
+        elif opline[0] == "D":
+            (self.op, self.path) = ("D", opline[2:].strip())
+        elif opline[0] in ("R", "C"):
+            (self.op, self.source, self.target) = shlex.split(opline)
+        elif opline == "deleteall":
+            self.op = "deleteall"
+        else:
+            raise FatalException("unexpected fileop %s while parsing" % opline)
+        self.copyname = None
+
+class Commit:
+    "Generic commit object."
+    def __init__(self, repo):
+        self.repo = repo
+        self.mark = None             # Mark name of commit (may be None)
+        self.authors = []            # Authors of commit
+        self.committer = None        # Person responsible for committing it.
+        self.comment = None          # Commit comment
+        self.parent_marks = []            # List of parent nodes
+        self.branch = None           # branch name
+        self.fileops = []            # blob and file operation list
+        self.properties = {}         # commit properties (extension)
+        self.taglist = []            # Tags that point at this commit
+        self.resetlist = []          # Branches that point at this commit
+        self.childbranches = []      # Count of child branches at this point.
+    def children(self):
+        "Get a list of this commit's children."
+        return filter(lambda e:self.mark in e.parent_marks,self.repo.commits()) 
+    def parents(self):
+        "Get a list of this commit's parents."
+        return filter(lambda e:e.mark in self.parent_marks,self.repo.commits()) 
+    def is_tip(self):
+        "Is this commit a branch tip?"
+        # Added for rcs-fast-import
+        for child in self.children():
+            if child.branch == self.branch:
+                return False
+        return True
+    def email_out(self):
+        msg = email.message.Message()
+        if self.authors:
+            self.authors[0].email_out(msg, "Author")
+            for (i, coauthor) in enumerate(self.authors[1:]):
+                coauthor.email_out(msg, "Author" + `2+i`)
+        self.committer.email_out(msg, "Committer")
+        empty_properties = []
+        propkeys = self.properties.keys()
+        propkeys.sort()
+        for name in propkeys:
+            value = self.properties[name]
+            if value in (True, False):
+                if value:
+                    empty_properties.append(name)
+            else:
+                hdr = "-".join(map(lambda s: s.capitalize(), name.split("-")))
+                msg["Property-" + hdr] = value
+        if empty_properties:
+            msg["Empty-Properties"] = ",".join(empty_properties)
+        # This is added for rcs-fast-import
+        msg["Mark"] = self.mark
+        if self.parent_marks:
+            msg["Parents"] = ", ".join(self.parent_marks)
+        msg.set_payload(self.comment)
+        return msg.as_string(False)
+
+class Passthrough:
+    "Represents a passthrough line."
+    def __init__(self, line):
+        self.text = line
+
+class FatalException(Exception):
+    "Unrecoverable error."
+    def __init__(self, msg):
+        self.msg = msg
+
+class Repository:
+    "Generic repository object."
+    def __init__(self):
+        self.name = None
+        self.readtime = None
+        self.readsize = 0
+        self.vcs = None
+        self.sourcedir = None
+        self.events = []    # A list of the events encountered, in order
+        self.nmarks = 0
+        self.branches = set([])
+        self.import_line = 0
+        self.basedir = os.getcwd()
+    # __enter and __exit__ added for rcs-fast-import
+    def __enter__(self):        
+        return self
+    def __exit__(self, type_unused, value_unused, traceback_unused):
+        self.cleanup()
+    def cleanup(self):
+        nuke(self.subdir(), "rcs-fast-import: cleaning up %s" % self.subdir())
+    def subdir(self, name=None):
+        if name is None:
+            name = self.name
+        if not name:
+            return os.path.join(self.basedir, ".rs" + `os.getpid()`)
+        else:
+            return os.path.join(self.basedir, ".rs" + `os.getpid()`+ "-" + name) 
+    def error(self, msg, atline=True):
+        if atline:
+            raise FatalException(msg + " at line " + `self.import_line`)
+        else:
+            raise FatalException(msg)
+    def warn(self, msg, atline=True):
+        if atline and self.import_line:
+            print "rcs-fast-import: " + msg + " at line " + `self.import_line`
+        else:
+            print "rcs-fast-import: " + msg
+    def find(self, mark):
+        "Find an object by mark"
+        for (i, e) in enumerate(self.events):
+            if hasattr(e, "mark") and mark == e.mark:
+                return i
+        return None
+    def commits(self):
+        "Return a list of the repository commit objects."
+        return filter(lambda e: isinstance(e, Commit), self.events)
+    def fast_import(self, fp, progress=False):
+        "Initialize repo object from fast-import stream."
+        try:
+            try:
+                if verbose >= DEBUG_SHUFFLE:
+                    self.warn("repository fast import creates " + self.subdir())
+                os.mkdir(self.subdir())
+            except OSError:
+                self.error("can't create operating directory", atline=False)
+            with Baton("rcs-fast-import:", enable=progress) as baton:
+                self.import_line = 0
+                linebuffers = []
+                ncommits = 0
+                def read_data(dp, line=None):
+                    if not line:
+                        line = readline()
+                    if line.startswith("data <<"):
+                        delim = line[7:]
+                        while True:
+                            dataline = fp.readline()
+                            if dataline == delim:
+                                break
+                            elif not dataline:
+                                raise FatalException("EOF while reading blob")
+                    elif line.startswith("data"):
+                        try:
+                            count = int(line[5:])
+                            dp.write(fp.read(count))
+                        except ValueError:
+                            self.error("bad count in data")
+                    else:
+                        self.error("malformed data header %s" % `line`)
+                    line = readline()
+                    if line != '\n':
+                        pushback(line) # Data commands optionally end with LF
+                    return dp
+                def readline():
+                    if linebuffers:
+                        line = linebuffers.pop()
+                    else:
+                        self.import_line += 1
+                        line = fp.readline()
+                        self.readsize += len(line)
+                    return line
+                def pushback(line):
+                    linebuffers.append(line)
+                while True:
+                    line = readline()
+                    if not line:
+                        break
+                    elif not line.strip():
+                        continue
+                    elif line.startswith("blob"):
+                        blob = Blob(self)
+                        line = readline()
+                        if line.startswith("mark"):
+                            blob.mark = line[5:].strip()
+                            read_data(open(blob.blobfile(), "w")).close()
+                            self.nmarks += 1
+                        else:
+                            self.error("missing mark after blob")
+                        self.events.append(blob)
+                        baton.twirl()
+                    elif line.startswith("data"):
+                        self.error("unexpected data object")
+                    elif line.startswith("commit"):
+                        commitbegin = self.import_line
+                        commit = Commit(self)
+                        commit.branch = line.split()[1]
+                        self.branches.add(commit.branch)
+                        ncommits += 1
+                        while True:
+                            line = readline()
+                            if not line:
+                                break
+                            elif line.startswith("mark"):
+                                commit.mark = line[5:].strip()
+                                self.nmarks += 1
+                            elif line.startswith("author"):
+                                try:
+                                    commit.authors.append(Attribution(line[7:]))
+                                except ValueError:
+                                    self.error("malformed author line")
+                            elif line.startswith("committer"):
+                                try:
+                                    commit.committer = Attribution(line[10:])
+                                except ValueError:
+                                    self.error("malformed committer line")
+                            elif line.startswith("property"):
+                                fields = line.split(" ")
+                                if len(fields) < 3:
+                                    self.error("malformed property line")
+                                elif len(fields) == 3:
+                                    commit.properties[fields[1]] = True
+                                else:
+                                    name = fields[1]
+                                    length = int(fields[2])
+                                    value = " ".join(fields[3:])
+                                    if len(value) < length:
+                                        value += fp.read(length-len(value))
+                                        if fp.read(1) != '\n':
+                                            self.error("trailing junk on property value")
+                                    elif len(value) == length + 1:
+                                        value = value[:-1] # Trim '\n'
+                                    else:
+                                        self.error("garbage length field on property line")
+                                    commit.properties[name] = value
+                            elif line.startswith("data"):
+                                dp = read_data(cStringIO.StringIO(), line)
+                                commit.comment = dp.getvalue()
+                                dp.close()
+                            elif line.startswith("from") or line.startswith("merge"):
+                                commit.parent_marks.append(line.split()[1])
+                            # Handling of file ops begins.
+                            elif line[0] in ("C", "D", "R"):
+                                commit.fileops.append(FileOp(line, commit))
+                            elif line == "filedeleteall\n":
+                                commit.fileops.append(FileOp("filedeleteall", commit))
+                            elif line[0] == "M":
+                                fileop = FileOp(line, commit)
+                                if commit.mark is None:
+                                    self.warn("unmarked commit")
+                                commit.fileops.append(fileop)
+                                if fileop.ref[0] == ':':
+                                    for obj in self.events:
+                                        if isinstance(obj, Blob) and obj.mark == fileop.ref:
+                                            obj.path = fileop.path
+                                            fileop.copyname = obj.blobfile()
+                                            break
+                                    else:
+                                        self.error("no blob matches commit reference to %s" % fileop.ref)
+                                elif fileop.ref == 'inline':
+                                    fileop.copyname = "inline-" + `id(commit)`
+                                    read_data(open(os.path.join(self.subdir(), fileop.copyname), "w")).close()
+                                else:
+                                    self.error("unknown content type in filemodify")
+                            # Handling of file ops ends.
+                            elif line.isspace():
+                                # This handles slightly broken
+                                # exporters like the bzr-fast-export
+                                # one that may tack an extra LF onto
+                                # the end of data objects.  With it,
+                                # we don't drop out of the
+                                # commit-processing loop until we see
+                                # a *nonblank* line that doesn't match
+                                # a commit subpart.
+                                continue
+                            else:
+                                pushback(line)
+                                break
+                        if not (commit.mark and commit.committer):
+                            self.import_line = commitbegin
+                            self.error("missing required fields in commit")
+                        self.events.append(commit)
+                        baton.twirl()
+                    elif line.startswith("reset"):
+                        reset = Reset()
+                        reset.ref = line[6:].strip()
+                        line = readline()
+                        if line.startswith("from"):
+                            reset.committish = line[5:].strip()
+                        else:
+                            pushback(line)
+                        self.events.append(reset)
+                        baton.twirl()
+                    elif line.startswith("tag"):
+                        tagger = None
+                        tagname = line[4:].strip()
+                        line = readline()
+                        if line.startswith("from"):
+                            referent = line[5:].strip()
+                        else:
+                            self.error("missing from after tag")
+                        line = readline()
+                        if line.startswith("tagger"):
+                            try:
+                                tagger = Attribution(line[7:])
+                            except ValueError:
+                                self.error("malformed tagger line")
+                        else:
+                            self.warn("missing tagger after from in tag")
+                            pushback(line)
+                        dp = read_data(cStringIO.StringIO())
+                        tag = Tag(tagname, referent, tagger, dp.getvalue())
+                        self.events.append(tag)
+                        baton.twirl()
+                    else:
+                        # Simply pass through any line we don't understand.
+                        self.events.append(Passthrough(line))
+                self.import_line = 0
+            self.readtime = time.time()
+            # Resolve tags and branches
+            # Added for rcs-fast-import
+            for event in self.events:
+                if isinstance(event, Tag):
+                    for commit in self.commits():
+                        if commit.mark == event.committish:
+                            commit.taglist.append(tag)
+                            break
+                    else:
+                        raise FatalException("tag points at nonexistent %s"
+                                                     % event.committish)
+                elif isinstance(event, Reset) and event.committish is not None:
+                    for commit in self.commits():
+                        if commit.mark == event.committish:
+                            commit.resetlist.append(event)
+                            break
+                    else:
+                        raise FatalException("reset points at nonexistent %s"
+                                                     % event.committish)
+
+        except KeyboardInterrupt:
+            nuke(self.subdir(), "rcs-fast-import: import interrupted, removing %s" % self.subdir())
+            raise KeyboardInterrupt
+    # Container emulation methods
+    def __len__(self):
+        return len(self.events)
+    def __getitem__(self, i):
+        return self.events[i]
+    def __setitem__(self, i, v):
+        self.events[i] = v
+
+def sanecheck(event_unused, path, mode):
+    "Sanity-check an operation to see if we can cope."
+    if mode == "160000":
+        raise FatalException("cannot import submodule link %s" % path)
+    elif mode == "120000":
+        raise FatalException("cannot import a symlink %s"% path)
+    if not mode[-3:] in ('644', '755'):
+        raise FatalException("unknown mode %s on %s" % (mode, path))
+
+def complain(msg):
+    print >>sys.stderr, "rcs-fast-import:", msg
+
+def announce(msg):
+    print "rcs-fast-import:", msg
+
+def do_or_die(cmd, legend=""):
+    "Either execute a command or raise a fatal exception."
+    if legend:
+        legend = " "  + legend
+    if verbose >= DEBUG_COMMANDS:
+        announce("executing '%s'%s" % (cmd, legend))
+    if not verbose >= DEBUG_UNQUIET:
+        cmd += ">/dev/null 2>&1" 
+    try:
+        retcode = subprocess.call(cmd, shell=True)
+        if retcode < 0:
+            raise FatalException("child was terminated by signal %d." % -retcode)
+        elif retcode != 0:
+            raise FatalException("child returned %d." % retcode)
+    except OSError, e:
+        raise FatalException("execution of %s%s failed: %s" % (cmd, legend, e))
+
+def loud_remove(path):
+    if verbose >= DEBUG_SHUFFLE:
+        announce("removing %s" % (path,))
+    os.remove(path)
+
+def loud_rename(source, target):
+    if verbose >= DEBUG_SHUFFLE:
+        announce("renaming %s to %s" % (source, target))
+    os.rename(source, target)
+#
+# All VCS-specific code is beyond this point.  At the moment there's
+# just one VCS class, for RCS, but it would be easy to write another
+# subclass for, say, SCCS.
+#
+# The Generic class assumes that the VCS is file-oriented and that
+# the checkout tool can operate from a top-level directory to check
+# our working-file paths. It also assumes that we have to stuff
+# commit metadata in comments as RFC822 headers if we want to keep it.
+
+class GenericRev:
+    "Encapsulate operations on an RCS/SCCS ID."
+    def __init__(self, rev=None):
+        if rev is None:
+            self.rev = [1, 1]
+        else:
+            self.rev = rev
+    def __hash__(self):
+        "Make these valid dictionary keys,"
+        return hash(tuple(self.rev))
+    def successor(self):
+        "Return the successor of this ID."
+        s = GenericRev(self.rev)
+        s.rev[-1] += 1
+        return s
+    def branch(self, branchnum=None):
+        "With arg, return ID for the tip of a new branch."
+        if branchnum is None:
+            return GenericRev(self.rev[:-1])
+        else:
+            return GenericRev(self.rev + [branchnum, 1])
+    def __str__(self):
+        return ".".join(map(str, self.rev))
+
+class Generic:
+    "Generic file-oriented VCS - could be used for SCCS as well as RCS."
+    revfactory = GenericRev
+    def __init__(self):
+        self.roundtrip = False
+        if not os.path.exists(self.__class__.repodirectory):
+            try:
+                os.makedirs(self.__class__.repodirectory)
+            except OSError:
+                raise FatalException("can't create RCS directory.")
+        self.branch_tips = {}
+    def get_tip(self, path, branch):
+        "Get the tip ID for a patch/branch combination that already exists." 
+        return self.branch_tips[(path, branch)]
+    def make_tip(self, commit, path):
+        "Make a new tip ID for a given path and branch."
+        # This is the only manipulation of the branch structure there is.
+        if not os.path.exists(self.master(path)):
+            myrev = self.revfactory()
+        else:
+            parents = commit.parents()
+            if len(parents) > 1:
+                complain("cannot preserve merge information.")
+            # Find an ancestor commit that checked in this file.
+            # That rev is the branch tip for this file.
+            ancestor = commit
+            while True:
+                if not ancestor.parents:
+                    raise FatalException("can't find ancestor for %s %s" \
+                                     % (path, commit.branch))
+                ancestor = ancestor.parents()[0]
+                if (path, ancestor.branch) in self.branch_tips:
+                    tip = self.branch_tips[(path, ancestor.branch)]
+                    break
+            if ancestor.branch == commit.branch:
+                # Not going down a branch point.
+                myrev = tip.successor()
+            else:
+                # Going down a branch point.
+                if commit.branch not in parents[0].childbranches:
+                    parents[0].childbranches.append(commit.branch)
+                branchnum = parents[0].childbranches.index(commit.branch) + 1
+                myrev = tip.branch(branchnum)
+        if verbose >= DEBUG_BRANCHING:
+            print "Assigning", myrev, "to", path
+        self.branch_tips[(path, commit.branch)] = myrev
+        return myrev
+    def master(self, filename):
+        "Return the master file corresponding to a specified filename."
+        parts = list(os.path.split(filename))
+        parts.insert(-1, self.__class__.repodirectory)
+        return self.__class__.mastertemplate % os.path.join(*parts)
+    def instantiate(self, path, copyfile=None):
+        rcsdir = os.path.join(os.path.dirname(path), self.__class__.repodirectory)
+        if not os.path.exists(rcsdir):
+            try:
+                os.makedirs(rcsdir)
+            except OSError:
+                raise FatalException("can't create %s." % rcsdir)
+        if copyfile:
+            if verbose >= DEBUG_SHUFFLE:
+                announce("linking %s to %s" % (os.path.relpath(copyfile), path))
+            try:
+                os.link(copyfile, path)
+            except OSError, e:
+                raise FatalException("refusing to step on %s: %s." % (path,`e`))
+        return rcsdir
+    def masterfiles(self):
+        "List all masters."
+        res = []
+        for root, dirs, files in os.walk(os.getcwd(), topdown=False):
+            if root.endswith(os.sep + self.__class__.repodirectory):
+                for name in files:
+                    res.append(os.path.join(root, name))
+        return res
+    def precommit(self, event):
+        #self.record("commit")
+        pass
+    def supercheckin(self, commit, op, path, legend):
+        "You knew the job was dangerous when you took it."
+        if self.roundtrip:
+            comment = event.email_out()
+        else:
+            comment = event.comment
+        rev = self.make_tip(commit, path)
+        do_or_die(self.checkin(commit, comment, op, path, rev), legend)
+        loud_remove(path)
+        if commit.is_tip():
+            self.maketag(commit.branch, str(rev.branch()), path)
+        for reset in commit.resetlist:
+            self.maketag(reset.ref, str(rev), path)
+    def modify(self, event, path, mode, copyfile):
+        "Perform file checkins and modifications,"
+        sanecheck(event, path, mode)
+        self.instantiate(path, copyfile)
+        self.supercheckin(event, "M", path, "modify")
+        #self.record("M", path)
+    def copy(self, commit, source, target, legend="Copy"):
+        "Perform copies. Start the copy with no history."
+        if os.path.exists(self.master(target)):
+            raise FatalException("copy to existing file")
+        do_or_die(self.checkout(source, commit.branch), legend)
+        self.instantiate(target)
+        loud_rename(source, target)
+        self.supercheckin(commit, legend[0], target, "copy")
+        #self.record("C", source)
+        #self.record("T", target)
+    def delete(self, commit, path, legend="delete"):
+        "Mark a path deleted, but don't actually remove the master."
+        self.instantiate(path)
+        open(path, "w").close()
+        self.supercheckin(commit, "D", path, legend)
+        #self.record("D", path)
+    def rename(self, commit, source, target):
+        "Perform RCS renames, carrying history with the rename."
+        self.copy(commit, source, target, legend="Rename")
+        self.delete(commit, source, legend="Rename")
+
+class RCS(Generic):
+    "Class encapsulating RCS version-control operations."
+    repodirectory = "RCS"
+    mastertemplate = "%s,v"
+    def __init__(self):
+        Generic.__init__(self)
+    def checkin(self, commit, comment, op, path, rev):
+        "Check in a new revision - also used to create new masters."
+        command = "ci -l%s" % rev
+        if op == "D":
+            command += " -sDeleted"
+        command += " -d'%s'" % commit.committer.date.rfc822()
+        command += ' -m"%s"' % comment.replace('"', '\\"')
+        command += " " + path + " " + self.master(path)
+        return command
+    def checkout(self, path, branch):
+        "Check out the latest revision corresponding to path and branch."
+        return "co -r%s %s" % (self.get_tip(path, branch), self.master(path))
+    def maketag(self, name, rev, path):
+        "Attach a tag to a file, overwriting any previous."
+        do_or_die("rcs -N'%s':%s %s" % (name, rev, self.master(path)))
+    def postcommit(self, event):
+        "Save annotated tags for round-tripping."
+        for tag in event.taglist:
+            with file("ANNOTATED-TAGS", "w") as fp:
+                fp.write(tag.email_out())
+            do_or_die("ci -l -m'Annotated tag %s' -d'%s' ANNOTATED-TAGS,v"
+                      % (tag.name, tag.tagger.date.rfc822()))
+            os.remove("ANNOTATED-TAGS")
+            do_or_die("rcs -n'%s': %s" % (tag.name, " ".join(self.masterfiles())))
+    def postactions(self, switch):
+        "Post-conversion actions."
+        if switch != '-l':
+            do_or_die("rcs -u %s" % (" ".join(self.masterfiles()),))
+            if switch == '-u':
+                do_or_die("co -u %s" % (" ".join(self.masterfiles()),))
+
+if __name__ == '__main__':
+    (options, arguments) = getopt.getopt(sys.argv[1:], "lpuvV?")
+    do_unlocked_checkouts = False
+    checkout_mode = None
+    roundtrip = True
+    for (switch, val) in options:
+	if (switch == '-?'):
+	    print __doc__
+            raise SystemExit, 0
+        elif switch == '-p':
+            roundtrip = False
+        elif switch in ('-l', '-u'):
+            checkout_mode = switch
+	elif (switch == '-v'):
+	    verbose += 1
+	elif (switch == '-V'):
+	    print "rcs-fast-import version %s" % version
+
+    vcs = RCS()
+    vcs.roundtrip = roundtrip 
+    try:
+        with Repository() as repo:
+            here = os.getcwd()
+            tempdir = "temp-import-" + `os.getpid()`
+            try:
+                try:
+                    os.mkdir(tempdir)
+                    os.chdir(tempdir)
+                except OSError:
+                    raise FatalException("Couldn't create working directory.")
+                repo.fast_import(sys.stdin, progress=verbose>0)
+                lastcommit = None
+                for event in repo.commits():
+                    if verbose >= DEBUG_BRANCHING:
+                        if not lastcommit or lastcommit.branch != event.branch:
+                            print "commit", event.branch
+                        else:
+                            print "commit"
+                    lastcommit = event
+                    vcs.precommit(event)
+                    for op in event.fileops:
+                        if op.op == "M":
+                            if verbose >= DEBUG_OPS:
+                                announce("%5s M %s" % (event.mark, op.path))
+                            if op.mode == "160000":
+                                complain("cannot represent a submodule link in RCS")
+                            else:
+                                vcs.modify(event, op.path, op.mode, op.copyname)
+                        elif op.op in ("D", "deleteall"):
+                            if verbose >= DEBUG_OPS:
+                                announce("%5s D %s" % (event.mark, op.path))
+                            vcs.delete(op.path)
+                        elif op.op == "R":
+                            if verbose >= DEBUG_OPS:
+                                announce("%5s R '%s' '%s'" % (event.mark, op.source, op.target))
+                            vcs.rename(event, op.source, op.target)
+                        elif op.op == "C":
+                            if verbose >= DEBUG_OPS:
+                                announce("%5s C '%s' '%s'" % (event.mark, op.source, op.target))
+                            vcs.copy(event, op.source, op.target)
+                        else:
+                            raise FatalException("unknown op type %s" % op.op)
+                    vcs.postcommit(event)
+                loud_rename(vcs.repodirectory,
+                            os.path.join(here, vcs.repodirectory))
+                os.chdir(here)
+            finally:
+                nuke(tempdir, "cleaning up")
+            vcs.postactions(checkout_mode)
+        raise SystemExit, 0
+    except FatalException, e:
+        complain(e.msg)
+        raise SystemExit, 1
+    except OSError, e:
+        complain(e)
+        raise SystemExit, 1
+
+# end

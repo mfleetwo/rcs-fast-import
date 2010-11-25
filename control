@@ -1,0 +1,17 @@
+# This is not a real Debian control file
+# It's project metadata for the shipper tool
+
+Package: rcs-fast-import
+
+Description: unpack a git fast-import stream into an RCS file tree
+ The metadata in modern DVCSes can't really be stuffed back into RCS,
+ but this tool makes a valiant effort and may be useful for extracting
+ the revision histories of individual files from a project history.
+.
+ I wrote this as a prod at more recent and putatively more advanced
+ version-control systems that don't have .fi importers yet.  If crufty
+ old RCS can import these streams, why can't yours?
+
+Homepage: http://www.catb.org/~esr/rcs-fast-import
+
+XBS-Project-Tag-List: version control, git

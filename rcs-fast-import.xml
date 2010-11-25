@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE refentry PUBLIC 
+   "-//OASIS//DTD DocBook XML V4.1.2//EN"
+   "docbook/docbookx.dtd">
+<refentry id='rcs-fast-import.1'>
+<refmeta>
+<refentrytitle>rcs-fast-import</refentrytitle>
+<manvolnum>1</manvolnum>
+<refmiscinfo class='date'>Nov 11 2010</refmiscinfo>
+<refmiscinfo class='productname'>rcs-fast-import</refmiscinfo>
+<refmiscinfo class='source'>rcs-fast-import</refmiscinfo>
+<refmiscinfo class='manual'>Development Tools</refmiscinfo>
+</refmeta>
+<refnamediv id='name'>
+<refname>rcs-fast-import</refname>
+<refpurpose>unpack a fast-import stream into an RCS repository tree</refpurpose>
+</refnamediv>
+<refsynopsisdiv id='synopsis'>
+
+<cmdsynopsis>
+  <command>rcs-fast-import</command>
+  <arg choice='opt'>-v</arg>
+  <arg choice='opt'>-u</arg>
+  <arg choice='opt'>-l</arg>
+  <arg choice='opt'>-p</arg>
+  <arg choice='opt'>-V</arg>
+  <arg choice='opt'>-?</arg>
+</cmdsynopsis>
+</refsynopsisdiv>
+
+<refsect1 id='description'><title>DESCRIPTION</title>
+
+<para>This tool breaks the content of a git-fast-import stream on
+stdin into individual RCS master files in RCS subdirectories of the
+corresponding directory structure.</para>
+
+<para>Normally, all import-stream per-commit metadata that RCS cannot
+represent natively is written into each comment as RFC-822 mail
+headers, followed by a blank line; this includes mark, committer and
+author data, mark cross-references to parent commits, and extension
+properties. The -p option suppresses this, producing a plain RCS
+comment.</para>
+
+<para>With the -v option, emit a twirling-baton prompt during stream read and
+do not suppress progess messages from the RCS tools.</para>
+
+<para>With the -l option, check out and lock all resulting files at their latest
+revisions; with the -u option, check out but do not lock.  With neither
+option, the RCS subdirectories and masters are created but no working
+copies checked out.</para>
+
+<para>The -V option displays the program version number and exits. -? displays
+a help message and exits.</para>
+
+<para>In order to preserve history, D file operations do not delete
+previously-created master files; instead, an empty file is checked in
+as the content and the file's RCS state tag is set to "Deleted".  R
+file operations copy corresponding RCS master files <emphasis>without
+</emphasis> deleting the old master file; instead, an empty fiile is
+checked in as the content and the state set to "Renamed". C operations
+initialize a new file.</para>
+
+<para>Import-stream branches are mapped to RCS revision branch structure.
+Each RCS master poduced will include a list of branch tags, each of which
+has the value of the corresponding RCS branch identifier for that file.</para>
+</refsect1>
+
+<refsect1 id='bugs'><title>BUGS</title>
+<para>The following limitations are inherent in the RCS format:</para>
+
+<para>Annotated tags cannot be preserved in a format readily accessible
+to RCS. This tool deposits them as tagged revisions of a file named
+<filename>ANNOTATED-TAGS</filename> in the toplevel RCS
+directory.</para>
+
+<para>In each commit, the committer date entered in RCS metadata will
+be the committer date from the import stream, but the committer
+identity will be lost; all commits are checked in as if by the
+invoking user and identified with the invoking user's login name.
+(However, this tool preserves complete attribution in comment headers
+unless the -p option was selected.)</para>
+
+<para>Lightweight tags and branches may cause errors in older RCS versions,
+as they are saved with their full (path) names, including slashes.</para>
+
+<para>Submodule links ("M" entries mith mode 160000) and symlinks ("M"
+entries mith mode 120000) can't be handled; the tool will throw an
+error if it sees one.</para>
+
+<para>The following are implementation limits of this tool which may be 
+fixed in a future release:</para>
+
+<para>This tool has not been tested with RCS versions earlier than
+5.7.  It is likely older versions will throw errors on some tag and
+branch names that are legal in fast-import files.</para>
+</refsect1>
+
+<refsect1 id='returns'><title>ERROR RETURNS</title>
+<para>Returns 1 on any error, 0 otherwise.</para>
+</refsect1>
+
+<refsect1 id='author'><title>AUTHOR</title>
+
+<para>Eric S. Raymond <email>esr@thyrsus.com</email>; project page at <ulink
+url='http://www.catb.org/~esr/rcs-fast-import'>http://www.catb.org/~esr/rcs-fast-import</ulink>.</para>
+</refsect1>
+</refentry>
