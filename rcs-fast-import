@@ -812,7 +812,7 @@ if __name__ == '__main__':
                         elif op.op in ("D", "deleteall"):
                             if verbose >= DEBUG_OPS:
                                 announce("%5s D %s" % (event.mark, op.path))
-                            vcs.delete(op.path)
+                            vcs.delete(event, op.path)
                         elif op.op == "R":
                             if verbose >= DEBUG_OPS:
                                 announce("%5s R '%s' '%s'" % (event.mark, op.source, op.target))
