@@ -777,6 +777,7 @@ if __name__ == '__main__':
 	    verbose += 1
 	elif (switch == '-V'):
 	    print "rcs-fast-import version %s" % version
+            raise SystemExit, 0
 
     vcs = RCS()
     vcs.roundtrip = roundtrip 
