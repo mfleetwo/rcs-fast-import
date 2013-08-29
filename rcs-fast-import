@@ -440,8 +440,8 @@ class Repository:
                                     else:
                                         self.error("no blob matches commit reference to %s" % fileop.ref)
                                 elif fileop.ref == 'inline':
-                                    fileop.copyname = "inline-" + `id(commit)`
-                                    read_data(open(os.path.join(self.subdir(), fileop.copyname), "w")).close()
+                                    fileop.copyname = os.path.join(self.subdir(), "inline-" + `id(commit)`)
+                                    read_data(open(fileop.copyname, "w")).close()
                                 else:
                                     self.error("unknown content type in filemodify")
                             # Handling of file ops ends.
