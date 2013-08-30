@@ -735,7 +735,7 @@ class RCS(Generic):
         if op == "D":
             command += " -sDeleted"
         command += " -d'%s'" % commit.committer.date.rfc822()
-        command += ' -m"%s"' % comment.replace('"', '\\"')
+        command += " -m'%s'" % comment.replace("'", "'\"'\"'")
         command += " " + path + " " + self.master(path)
         return command
     def checkout(self, path, branch):
