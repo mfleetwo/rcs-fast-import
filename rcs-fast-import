@@ -552,7 +552,7 @@ def do_or_die(cmd, legend=""):
     if verbose >= DEBUG_COMMANDS:
         announce("executing '%s'%s" % (cmd, legend))
     if not verbose >= DEBUG_UNQUIET:
-        cmd += ">/dev/null 2>&1" 
+        cmd = "(" + cmd + ") >/dev/null 2>&1" 
     try:
         retcode = subprocess.call(cmd, shell=True)
         if retcode < 0:
