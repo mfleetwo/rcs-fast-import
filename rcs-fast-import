@@ -596,6 +596,19 @@ class GenericRev:
         s = GenericRev(self.rev)
         s.rev[-1] += 1
         return s
+    def parent(self):
+        "Return the parent of this ID."
+        if self.rev == [1, 1]:
+            return None
+        p = GenericRev(list(self.rev))
+        if p.rev[-1] > 1:
+            p.rev[-1] -= 1
+        else:
+            p.rev = p.rev[:-2]
+        return p
+    def __ne__(self, other):
+        "Return true if self and other are different IDs."
+        return self.rev != other.rev
     def branch(self, branchnum=None):
         "With arg, return ID for the tip of a new branch."
         if branchnum is None:
@@ -729,14 +742,24 @@ class RCS(Generic):
     mastertemplate = "%s,v"
     def __init__(self):
         Generic.__init__(self)
+        self.previous_revs = {}		# Most recently checked in revision for each path
     def checkin(self, commit, comment, op, path, rev):
         "Check in a new revision - also used to create new masters."
-        command = "ci -l%s" % rev
+        rcspath = self.master(path)
+        command = ""
+        prev_rev = self.previous_revs.get(path)
+        parent = rev.parent()
+        if prev_rev != parent:
+            # Checking in on a different RCS branch to last time.  Lock
+            # this revisions parent first.
+            command = "rcs -u %s && rcs -l%s %s && " % (rcspath, parent, rcspath)
+        command += "ci -l%s" % rev
         if op == "D":
             command += " -sDeleted"
         command += " -d'%s'" % commit.committer.date.rfc822()
         command += " -m'%s'" % comment.replace("'", "'\"'\"'")
-        command += " " + path + " " + self.master(path)
+        command += " " + path + " " + rcspath
+        self.previous_revs[path] = rev
         return command
     def checkout(self, path, branch):
         "Check out the latest revision corresponding to path and branch."
