@@ -12,6 +12,8 @@ Description: unpack a git fast-import stream into an RCS file tree
  version-control systems that don't have .fi importers yet.  If crufty
  old RCS can import these streams, why can't yours?
 
+XBS-Destinations: freecode
+
 Homepage: http://www.catb.org/~esr/rcs-fast-import
 
 XBS-Project-Tag-List: version control, git
