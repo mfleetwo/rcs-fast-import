@@ -61,7 +61,7 @@ checked in as the content and the state set to "Renamed". C operations
 initialize a new file.</para>
 
 <para>Import-stream branches are mapped to RCS revision branch structure.
-Each RCS master poduced will include a list of branch tags, each of which
+Each RCS master produced will include a list of branch tags, each of which
 has the value of the corresponding RCS branch identifier for that file.</para>
 </refsect1>
 

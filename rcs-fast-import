@@ -29,7 +29,7 @@ this help and exits.
 import sys, os, getopt, re, cStringIO, subprocess
 import time, shlex, email.message, email.utils
 
-version="0.1"
+version = "0.2"
 
 #
 # Generic import-stream machinery swiped from reposurgeon begins here.
@@ -52,6 +52,8 @@ class Baton:
             self.stream = sys.stdout
         else:
             self.stream = None
+        self.count = 0
+        self.time = 0
     def __enter__(self):
         if self.stream:
             self.stream.write(self.prompt + "...")
@@ -214,10 +216,10 @@ class Commit:
         self.childbranches = []      # Count of child branches at this point.
     def children(self):
         "Get a list of this commit's children."
-        return filter(lambda e:self.mark in e.parent_marks,self.repo.commits()) 
+        return filter(lambda e:self.mark in e.parent_marks, self.repo.commits()) 
     def parents(self):
         "Get a list of this commit's parents."
-        return filter(lambda e:e.mark in self.parent_marks,self.repo.commits()) 
+        return filter(lambda e:e.mark in self.parent_marks, self.repo.commits()) 
     def is_tip(self):
         "Is this commit a branch tip?"
         # Added for rcs-fast-import
@@ -260,6 +262,7 @@ class Passthrough:
 class FatalException(Exception):
     "Unrecoverable error."
     def __init__(self, msg):
+        Exception.__init__(self)
         self.msg = msg
 
 class Repository:
@@ -320,7 +323,6 @@ class Repository:
             with Baton("rcs-fast-import:", enable=progress) as baton:
                 self.import_line = 0
                 linebuffers = []
-                ncommits = 0
                 def read_data(dp, line=None):
                     if not line:
                         line = readline()
@@ -378,7 +380,6 @@ class Repository:
                         commit = Commit(self)
                         commit.branch = line.split()[1]
                         self.branches.add(commit.branch)
-                        ncommits += 1
                         while True:
                             line = readline()
                             if not line:
@@ -440,8 +441,8 @@ class Repository:
                                     else:
                                         self.error("no blob matches commit reference to %s" % fileop.ref)
                                 elif fileop.ref == 'inline':
-                                    fileop.copyname = "inline-" + `id(commit)`
-                                    read_data(open(os.path.join(self.subdir(), fileop.copyname), "w")).close()
+                                    fileop.copyname = os.path.join(self.subdir(), "inline-" + `id(commit)`)
+                                    read_data(open(fileop.copyname, "w")).close()
                                 else:
                                     self.error("unknown content type in filemodify")
                             # Handling of file ops ends.
@@ -530,7 +531,7 @@ class Repository:
     def __setitem__(self, i, v):
         self.events[i] = v
 
-def sanecheck(event_unused, path, mode):
+def sanecheck(_event, path, mode):
     "Sanity-check an operation to see if we can cope."
     if mode == "160000":
         raise FatalException("cannot import submodule link %s" % path)
@@ -552,7 +553,7 @@ def do_or_die(cmd, legend=""):
     if verbose >= DEBUG_COMMANDS:
         announce("executing '%s'%s" % (cmd, legend))
     if not verbose >= DEBUG_UNQUIET:
-        cmd += ">/dev/null 2>&1" 
+        cmd = "(" + cmd + ") >/dev/null 2>&1"
     try:
         retcode = subprocess.call(cmd, shell=True)
         if retcode < 0:
@@ -596,6 +597,19 @@ class GenericRev:
         s = GenericRev(self.rev)
         s.rev[-1] += 1
         return s
+    def parent(self):
+        "Return the parent of this ID."
+        if self.rev == [1, 1]:
+            return None
+        p = GenericRev(list(self.rev))
+        if p.rev[-1] > 1:
+            p.rev[-1] -= 1
+        else:
+            p.rev = p.rev[:-2]
+        return p
+    def __ne__(self, other):
+        "Return true if self and other are different IDs."
+        return self.rev != other.rev
     def branch(self, branchnum=None):
         "With arg, return ID for the tip of a new branch."
         if branchnum is None:
@@ -670,12 +684,12 @@ class Generic:
             try:
                 os.link(copyfile, path)
             except OSError, e:
-                raise FatalException("refusing to step on %s: %s." % (path,`e`))
+                raise FatalException("refusing to step on %s: %s." % (path, `e`))
         return rcsdir
     def masterfiles(self):
         "List all masters."
         res = []
-        for root, dirs, files in os.walk(os.getcwd(), topdown=False):
+        for root, _dirs, files in os.walk(os.getcwd(), topdown=False):
             if root.endswith(os.sep + self.__class__.repodirectory):
                 for name in files:
                     res.append(os.path.join(root, name))
@@ -686,9 +700,9 @@ class Generic:
     def supercheckin(self, commit, op, path, legend):
         "You knew the job was dangerous when you took it."
         if self.roundtrip:
-            comment = event.email_out()
+            comment = commit.email_out()
         else:
-            comment = event.comment
+            comment = commit.comment
         rev = self.make_tip(commit, path)
         do_or_die(self.checkin(commit, comment, op, path, rev), legend)
         loud_remove(path)
@@ -729,14 +743,24 @@ class RCS(Generic):
     mastertemplate = "%s,v"
     def __init__(self):
         Generic.__init__(self)
+        self.previous_revs = {}		# Most recently checked in revision for each path
     def checkin(self, commit, comment, op, path, rev):
         "Check in a new revision - also used to create new masters."
-        command = "ci -l%s" % rev
+        rcspath = self.master(path)
+        command = ""
+        prev_rev = self.previous_revs.get(path)
+        parent = rev.parent()
+        if prev_rev != parent:
+            # Checking in on a different RCS branch to last time.  Lock
+            # this revisions parent first.
+            command = "rcs -u %s && rcs -l%s %s && " % (rcspath, parent, rcspath)
+        command += "ci -l%s" % rev
         if op == "D":
             command += " -sDeleted"
         command += " -d'%s'" % commit.committer.date.rfc822()
-        command += ' -m"%s"' % comment.replace('"', '\\"')
-        command += " " + path + " " + self.master(path)
+        command += " -m'%s'" % comment.replace("'", "'\"'\"'")
+        command += " " + path + " " + rcspath
+        self.previous_revs[path] = rev
         return command
     def checkout(self, path, branch):
         "Check out the latest revision corresponding to path and branch."
@@ -766,17 +790,18 @@ if __name__ == '__main__':
     checkout_mode = None
     roundtrip = True
     for (switch, val) in options:
-	if (switch == '-?'):
-	    print __doc__
+        if (switch == '-?'):
+            print __doc__
             raise SystemExit, 0
         elif switch == '-p':
             roundtrip = False
         elif switch in ('-l', '-u'):
             checkout_mode = switch
-	elif (switch == '-v'):
-	    verbose += 1
-	elif (switch == '-V'):
-	    print "rcs-fast-import version %s" % version
+        elif (switch == '-v'):
+            verbose += 1
+        elif (switch == '-V'):
+            print "rcs-fast-import version %s" % version
+            raise SystemExit, 0
 
     vcs = RCS()
     vcs.roundtrip = roundtrip 
@@ -811,7 +836,7 @@ if __name__ == '__main__':
                         elif op.op in ("D", "deleteall"):
                             if verbose >= DEBUG_OPS:
                                 announce("%5s D %s" % (event.mark, op.path))
-                            vcs.delete(op.path)
+                            vcs.delete(event, op.path)
                         elif op.op == "R":
                             if verbose >= DEBUG_OPS:
                                 announce("%5s R '%s' '%s'" % (event.mark, op.source, op.target))
